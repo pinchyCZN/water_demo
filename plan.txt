@@ -1,0 +1,904 @@
+Wave Race 64 Water Study                                   Project Plan
+
+
+                          WATER GRID STUDY
+
+
+Abstract
+
+   A standalone Direct3D 9 program that reproduces one effect from Wave
+   Race 64 and nothing else: the hexagonal water grid as the race
+   results screen shows it, viewed head on. It runs the original
+   simulation on the original mesh with the original textures, but
+   reaches the screen through D3D9 vertices rather than an N64 display
+   list, and it is driven by a real clock so the motion is correct at 60
+   Hz and above.
+
+   The point of the exercise is the time base. The N64 scheme is a
+   fixed-step integer integrator; getting it to behave at an arbitrary
+   display rate is the part that needs design, and section 6 is the
+   substance of this plan.
+
+Table of Contents
+
+   1. Goal And Scope
+   2. What Is Being Reproduced
+   3. Source Material
+      3.1. The Shell, From MOTORACER
+      3.2. The Algorithm, From _wr64
+      3.3. Textures
+   4. Data Model
+      4.1. The Simulation Buffer
+      4.2. The Visible Mesh
+      4.3. Vertex Attributes
+   5. The Algorithm
+   6. Time
+      6.1. Why The Original Scheme Will Not Take A Variable Step
+      6.2. The Fixed-Step Accumulator
+      6.3. Render Interpolation
+      6.4. Continuous-Time Reformulation
+   7. Milestones
+   8. Non-Goals
+   9. The Look
+      9.1. What The Original Sets
+      9.2. The Sphere Map
+      9.3. Per-Course Colour
+      9.4. The Backdrop Is A Flat Per-Course Fill
+  10. Drawing Waves
+      10.1. Why Depth Stops At 120
+      10.2. The push_sea Row Term
+      10.3. The Walker On The Menu Screens
+      10.4. The Seed, And Why The Triangles Showed
+  11. Open Questions
+
+
+1.  Goal And Scope
+
+   Open a window. Draw the Wave Race 64 water grid in the middle of it.
+   Let the waves propagate. Orbit and zoom the view. Click the water and
+   make a wave.
+
+   Three things make this worth doing separately from the port:
+
+   o  NO DISPLAY LISTS. The port builds N64 command lists and runs them
+      through a software RSP. Here the mesh data goes straight into a
+      D3D9 vertex buffer, so the simulation can be read and reasoned
+      about without a graphics pipeline in the way.
+
+   o  A REAL CLOCK. The port inherits the N64's one-tick-per-frame
+      assumption. This program separates simulation rate from display
+      rate deliberately, which is the only way the motion is right on a
+      144 Hz panel.
+
+   o  ONE EFFECT. No course, no boat, no HUD, no audio. When the water
+      looks wrong there is nothing else it could be.
+
+
+2.  What Is Being Reproduced
+
+   The results screen sets sea_mode = 1, and that selects the largest of
+   the three water configurations (ot_sea.c:1823):
+
+   +---------------------+-------+------------------------------------+
+   | constant            | value | role                               |
+   +=====================+=======+====================================+
+   | sea_disp_blocks (N) |    16 | hex radius in cells                |
+   | sea_disp_points     |   817 | vertices, 3*N*(N+1)+1              |
+   | sea_disp_size       |  1024 | world units across, N << 6         |
+   | suii_power          |    10 | shift for the averaging term       |
+   | wave_power          |     4 | shift for the difference term      |
+   | water_damp          |     5 | shift for the velocity decay       |
+   +---------------------+-------+------------------------------------+
+
+   N = 16 is the tight case: position_t is dimensioned 817, which is
+   exactly 3*N*(N+1)+1 at N = 16, so the mesh has no spare entry.
+
+   The in-race modes use N = 12, or N = 10 when sea_mode is 2 or two
+   players are racing, and 9/5/6 for the shifts. Read the directions
+   carefully, because they do not all point the same way: a LARGER
+   wave_power means a smaller difference term and so SLOWER propagation,
+   and a LARGER water_damp subtracts less and so lets waves PERSIST
+   LONGER. So in-race water propagates more slowly and lasts longer than
+   the results screen's, while the results screen has the weaker
+   restoring term of the two. Confirmed live on the ranking screen:
+   sea_mode 0, N 12, sea_disp_points 469, shifts 9/5/6.
+
+   The results screen is the one that shows the grid head on with the
+   patch centred at the origin and no camera motion, which is why it is
+   the target.
+
+   THE TICK RATE IS 30 Hz ON THIS SCREEN, NOT 20. The graph thread is
+   woken once every Graph_timing vertical retraces, so the simulation
+   rate is 60/Graph_timing (ot_pctask.c:294):
+
+       if (fc - frame_count_bak >= Graph_timing) {
+           frame_count_bak = fc;
+           Graph_timing    = Graph_timing_req;
+           osSendMesg(&MesgQ_T2G_timing, ...);
+       }
+
+   kn_main.h sets the divisor per screen, and the two that matter differ:
+
+   +------------------------+-----+--------+--------------------------+
+   | constant               | div | rate   | used by                  |
+   +========================+=====+========+==========================+
+   | GRAPH_TIMING_RACE      |   3 |  20 Hz | the race, machine select |
+   | GRAPH_TIMING_RESULT    |   2 |  30 Hz | results, course, record  |
+   +------------------------+-----+--------+--------------------------+
+
+   So the race physics runs at 20 Hz, and that is the figure to quote
+   for the game as a whole, but initMainGlistResult and
+   kn_psresult.c:728 both ask for GRAPH_TIMING_RESULT, which is 2. The
+   water on the results screen therefore steps at 30 Hz.
+
+   That pairing is consistent: sea_mode 1 uses the gentler shifts
+   (suii 10, wave 4, damp 5) at 30 Hz, while the race uses suii 9,
+   wave 5, damp 6 at 20 Hz with a smaller grid. The constants were tuned
+   against the rate the screen runs at, which is why SIM_DT has to be
+   the screen's rate and not the game's headline rate.
+
+       SIM_DT = 1.0 / 30.0        /* 33.333 ms */
+
+   See _wr64/docs/subsystems/ot_sea_report.txt for the full subsystem
+   write-up. This plan restates only what the program needs.
+
+
+3.  Source Material
+
+3.1.  The Shell, From MOTORACER
+
+   n:/DEV/MOTORACER has a working D3D9 host that already does everything
+   this program needs before it draws any water. Take it rather than
+   write another one.
+
+    +----------------+-------------------------------------------------+
+    | file           | what it provides                                |
+    +================+=================================================+
+    | src/main.cpp   | AllocConsole, window class, WinMain, the        |
+    |                | frame loop, and the pacer                       |
+    | src/d3d9rt.cpp | dynamic Direct3DCreate9, device create          |
+    |                | and reset, depth format choice,                 |
+    |                | letterboxing                                    |
+    | src/timing.h   | tm_init, tm_now, tm_real_now                    |
+    | src/timing.c   | QueryPerformanceCounter, pause and frame        |
+    |                | step                                            |
+    +----------------+-------------------------------------------------+
+
+   Two details of that code matter here:
+
+   o  R_FVF3 is already the untransformed format this program wants:
+      D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_SPECULAR | D3DFVF_TEX1, with
+      R_Vertex3 as {float x,y,z; uint color; uint specular; float
+      tu,tv;}. Geometry is submitted in camera space and D3D9 clips it
+      against a real frustum.
+
+   o  Stage 0 is a fixed-function combiner stage, which is all the sea
+      pass needs: its N64 combiner is TEXEL0 alone. No shader work.
+      See section 9.1 - the stage was set to MODULATE(TEXTURE, DIFFUSE)
+      until the combiner words were decoded, and that was wrong.
+
+   MOTORACER's own docs/subsystems/frame-loop.txt is worth reading
+   before section 6: it records that its race takes a whole frame delta
+   as one physics step, and what that cost them.
+
+3.2.  The Algorithm, From _wr64
+
+   Port the logic out of _wr64/src_n64/ot_sea.c. Do not port the display
+   list construction with it.
+
+   +--------------------------+--------------------------------------+
+   | function                 | what to take                         |
+   +==========================+======================================+
+   | make_data_table          | builds index_t and position_t, the   |
+   |                          | hex layout; run once                 |
+   | init_wave_high           | seeds the surface with random cell   |
+   |                          | heights                              |
+   | wave_sea                 | the propagation step, three phases   |
+   | push_sea                 | the wave injection; this is what a   |
+   |                          | mouse click calls                    |
+   | vertex_sea               | the bake; keep the geometry, drop    |
+   |                          | the N64 vertex packing               |
+   +--------------------------+--------------------------------------+
+
+   Deliberately left out: plus_sea and friends (buoyancy, no boat here),
+   get_sea_high (nothing samples the surface), waving_big (scripted
+   course waves), set_cloud_vertex and set_bottom_vertex, and all of
+   move_sea_one's camera-follow and patch-scroll bookkeeping, which the
+   results screen does not exercise.
+
+3.3.  Textures
+
+   Eight sea textures, one per weather theme, in
+   _wr64/src_n64/assets/tex_data/_recovered_data/:
+
+     sot_sea_dirt    sot_sea_eve     sot_sea_fine1   sot_sea_fine2
+     sot_sea_morn    sot_sea_night   sot_sea_sto     sot_sea_ice
+
+   THAT ORDER IS NOT ALPHABETICAL AND MUST NOT BE SORTED. It is
+   sea_tex_list's, because crs_sea[] indexes into it by position; see
+   section 9.3.
+
+   Each is an unsigned int name[1024], and the DL loads them with
+   G_SETTIMG 0xFD180000, which decodes to G_IM_FMT_RGBA and
+   G_IM_SIZ_32b. So each is 32 x 32 RGBA8888, 4096 bytes. The first word
+   of sot_sea_fine1 is 0xBEDADB7D: R 190, G 218, B 219, A 125.
+
+   Conversion is a swizzle. N64 packs RGBA in that byte order; D3D9
+   A8R8G8B8 wants ARGB.
+
+   All eight are EMBEDDED, in src/textures.c, derived from the arrays
+   above and verified byte-identical to them. They are unsigned char in
+   the N64's own R G B A order, so the data carries no endianness and
+   r_texture_upload does the swizzle per channel at load time. The
+   program reads no files at all; T steps through the courses.
+
+   The converter that produced them has been removed. src/textures.c is
+   now the only copy, so treat it as data: regenerating it means writing
+   the unpacker again against the arrays above.
+
+   There are also sot_sea_*_2p variants under assets/texture/ for the
+   split-screen case. Not needed.
+
+
+4.  Data Model
+
+4.1.  The Simulation Buffer
+
+   BigWaveCell is four bytes:
+
+     typedef struct { short height; short flags; } BigWaveCell;
+
+   height is the surface displacement in fixed point. flags is the
+   propagation accumulator, which behaves as a velocity. The buffer is
+   wave[384][128], 196608 bytes, and cells are addressed by a byte
+   offset computed as
+
+     offset = (((row % 384) << 7) | (col & 0x7F)) << 2
+
+   The masking is what makes the offset safe without a range check: the
+   result cannot leave the 384 x 128 array.
+
+   The buffer is far larger than the 817 visible cells because the
+   in-race patch scrolls across it. This program does not scroll, so a
+   smaller buffer would do; keep the original dimensions anyway so the
+   offset arithmetic is unchanged and the two can be compared.
+
+4.2.  The Visible Mesh
+
+   Two parallel tables, both built once:
+
+     typedef struct { int offset; short sx; short sy; } SeaScreenEntry;
+     typedef struct { unsigned char dx, dy; } SeaDispOffset;
+
+     SeaScreenEntry position_t[817];
+     SeaDispOffset  index_t[820];
+
+   sx and sy are the patch-local XZ of each mesh corner, fixed at init.
+   offset is the byte offset of that corner's cell in wave[], refreshed
+   every frame in the original because the patch moves. Here it can be
+   computed once, which is a simplification worth making explicit in the
+   code rather than silently.
+
+   Layout, per row of the hexagon: sx values are spaced 64 world units;
+   odd rows stagger sx by -32; row width is 2*N - abs(row). That yields
+   the 817 points, and the count is the centred hexagonal number
+   3*N*(N+1)+1.
+
+4.3.  Vertex Attributes
+
+   Per mesh corner, the original bakes:
+
+     world X = patch_center_x + sx
+     world Y = (cell.height >> 8) + sea_offset
+     world Z = patch_center_z + sy
+
+   and, for interior corners, a slope term from the finite difference of
+   the neighbouring cells' heights.
+
+   THAT SLOPE TERM IS NOT A LIGHTING NORMAL. It feeds generated texture
+   coordinates, an environment-map trick, and it is what gives Wave
+   Race's water its sheen. Reproducing the look means driving tu/tv from
+   the slope, not lighting a normal; per-vertex lighting instead will
+   look plausible and wrong. Section 9.2 has the mapping.
+
+
+5.  The Algorithm
+
+   Once, at startup:
+
+     build index_t and position_t      (make_data_table)
+     seed cell heights                 (init_wave_high)
+
+   Per simulation tick:
+
+     wave_sea()      propagate: three phases over the hex, walking
+                     position_t in order. Per coupled pair,
+
+                       avg  = (h_a + h_b) >> suii_power
+                       diff = (h_b - h_a) >> wave_power
+                       a.flags += diff - avg
+                       b.flags -= diff + avg
+
+                     then per cell, fold velocity into position and
+                     decay it,
+
+                       cell.height += cell.flags
+                       cell.flags  -= cell.flags >> water_damp
+
+     The three phases are the upper hex rows (widths N to 2N-1), the
+     lower rows (2N down to N+1), and a tip strip. The cursor advances
+     exactly 3*N*(N+1) positions, 816 at N = 16, one short of the 817
+     entries, so the walk cannot run off the end.
+
+   Per injection, from a click:
+
+     push_sea(px, pz, depth)   find the three cells of the containing
+                               triangle, write height, zero flags
+
+   Per rendered frame:
+
+     bake 817 vertices into R_Vertex3, build the index list, draw
+
+
+6.  Time
+
+6.1.  Why The Original Scheme Will Not Take A Variable Step
+
+   The three lines above are a fixed-step explicit integrator with the
+   step length baked in as 1. Each of them breaks differently if the
+   step changes:
+
+   o  THE DECAY IS PER-STEP, NOT PER-SECOND. `flags -= flags >> 5`
+      multiplies the velocity by 31/32 every tick. Under a variable step
+      the correct factor is pow(31/32, dt/dt0), and simply scaling the
+      subtraction by dt is not the same function.
+
+   o  THE INTEGRATION ASSUMES dt = 1. `height += flags` is explicit
+      Euler with the step folded into the units of flags, so height and
+      flags are not independently meaningful in seconds.
+
+   o  THE COUPLING SETS THE WAVE SPEED, AND WITH IT A STABILITY LIMIT.
+      The `>> wave_power` difference term is a discrete Laplacian;
+      explicit integration of a wave equation is only stable below a
+      step size that depends on it. Feeding a 6 ms step and a 40 ms step
+      into the same constants changes both the wave speed and whether
+      the system stays bounded.
+
+   o  THE ARITHMETIC IS INTEGER. The shifts are exact only for the
+      shifts the original chose. Rescaling them per frame reintroduces
+      rounding that the fixed-point design assumed away.
+
+   So the honest position is that the original cannot be handed a
+   variable dt without being re-derived, and re-deriving it risks
+   changing the character of the water, which is the one thing this
+   program exists to preserve.
+
+6.2.  The Fixed-Step Accumulator
+
+   Run the simulation at its native rate and let the display rate float.
+   This is the standard fixed-timestep pump:
+
+     accumulator += real_dt            (from tm_real_now)
+     steps = 0
+     while (accumulator >= SIM_DT && steps < MAX_STEPS) {
+         save previous heights
+         wave_sea()
+         accumulator -= SIM_DT
+         steps++
+     }
+     if (steps == MAX_STEPS)
+         accumulator = 0            /* give up the backlog */
+
+   What this buys: the integer arithmetic is untouched, so the water is
+   bit-identical to the original tick for tick; the display can present
+   at any rate; and nothing about stability or wave speed needs retuning.
+
+   MAX_STEPS exists to stop the spiral of death. If a stall leaves 400
+   ms in the accumulator, catching up with 12 steps costs more than a
+   frame and the backlog grows. Cap it, drop the remainder, and accept
+   that a hitch slows the water briefly rather than locking the program.
+   Eight is a reasonable cap.
+
+   SIM_DT is 1/30 s on this screen; see section 2 for where that comes
+   from and why it is not the game's 20 Hz race rate.
+
+6.3.  Render Interpolation
+
+   A fixed sim rate under a faster display rate shows as judder unless
+   the renderer interpolates. Keep the previous tick's 817 heights and
+   blend:
+
+     alpha = accumulator / SIM_DT          /* 0 .. 1 */
+     y     = lerp(prev_height[i], curr_height[i], alpha)
+
+   Two height arrays of 817 shorts is 3.2 KB, so the cost is nothing.
+   Interpolate only for the bake; the simulation keeps stepping on
+   integers.
+
+   The slope term should be computed from the interpolated heights, not
+   carried from the last tick, or the sheen will step at the sim rate
+   while the surface moves smoothly.
+
+6.4.  Continuous-Time Reformulation
+
+   A stretch goal, and only once 6.2 looks right, because 6.2 is the
+   reference it has to be judged against.
+
+   Restate the scheme in floats with time in seconds: velocity decay as
+   an exponential, the coupling as a wave-equation term with an explicit
+   speed, and a substep count chosen from the CFL limit so the step is
+   always stable. Then measure, rather than eyeball: run both for a
+   fixed number of seconds from the same seed and the same injections,
+   and compare the 817 heights by RMS error.
+
+   If it diverges, the fixed-step version stays and this becomes a note
+   about why. That is a perfectly good outcome; the goal is correct
+   motion at high refresh, and 6.2 already delivers that.
+
+
+7.  Milestones
+
+   Each one ends with something on screen, and each is a place to stop.
+
+   M0  WINDOW. main.cpp and d3d9rt.cpp lifted from MOTORACER, console
+       plus a cleared D3D9 window, timing module in, fps on the console.
+
+   M1  MESH. make_data_table ported, 817 vertices, drawn as wireframe or
+       points, flat. Verifies the hex topology and the point count
+       before anything moves.
+
+   M2  TEXTURE. One sea texture converted and applied, triangle list
+       built, flat lit water. Verifies winding, UVs and the modulate
+       stage.
+
+   M3  MOTION. wave_sea ported, fixed-step accumulator per 6.2, render
+       interpolation per 6.3, a key to inject a wave. The first point at
+       which it should look like Wave Race.
+
+   M4  VIEW. Orbit and zoom on the mouse, with the head-on results-screen
+       framing as the default and a key to return to it.
+
+   M5  PICKING. Done. X held unprojects the cursor onto the water plane
+       and calls sea_push, stamping from the previous sample to the
+       current one so a drag leaves a ridge rather than a dotted line.
+       pick_water inverts exactly the projection r_set_camera builds;
+       the two share kFovY so they cannot drift apart. sea_contains
+       bounds it, because sea_push wraps rather than misses.
+
+   M6  SLOPE SHEEN. Done. Section 9 records what the original does and
+       what was built: the sphere-map coordinates, the translucent
+       blend, and the eight per-course textures on T.
+
+   M7  STRETCH. The continuous-time reformulation of 6.4, with the RMS
+       comparison against M3 as its acceptance test. C selects 20, 30
+       or 60 Hz, which makes the problem visible rather than solving
+       it: the state depends on the tick count and not on elapsed
+       time, so 60 Hz for one second, 30 for two and 20 for three all
+       reach the same surface. Measured, not assumed.
+
+
+8.  Non-Goals
+
+   o  No N64 display lists, no software RSP, no gbi.h.
+   o  No boat, buoyancy, course geometry, HUD, audio or input replay.
+   o  No scrolling patch. The results screen centres it at the origin
+      and leaves it there; the camera-follow and corner-ring
+      interpolation in move_sea_one and vertex_sea are out of scope.
+   o  No 2-player split screen, and none of the _2p texture variants.
+   o  No attempt at a byte-identical match to the ROM. This is a study
+      of the effect, not a decompilation; _wr64 is where fidelity work
+      belongs.
+
+
+9.  The Look
+
+   The water does not look like a textured grid because it is not one.
+   It is a translucent sphere-mapped surface blended over the course
+   background, and all three of those words carry weight: get any one
+   of them wrong and the sheen does not appear.
+
+9.1.  What The Original Sets
+
+   make_sea_glist, _wr64/src_n64/sot_world.c, builds the state by hand
+   as raw command words. Decoded:
+
+   +----------------------+------------+------------------------------+
+   | Command              | Word       | Meaning                      |
+   +======================+============+==============================+
+   | G_SETGEOMETRYMODE    | 0x00000005 | G_ZBUFFER and G_SHADE only.  |
+   |                      |            | No G_TEXTURE_GEN and no      |
+   |                      |            | G_LIGHTING, so the RSP is    |
+   |                      |            | not generating the texture   |
+   |                      |            | coordinates. vertex_sea is.  |
+   +----------------------+------------+------------------------------+
+   | G_SETCOMBINE         | 0xFCFFFFFF | RGB = TEXEL0, A = TEXEL0_A,  |
+   |                      | 0xFFFCF279 | in both cycles. The texture  |
+   |                      |            | alone: no shade term and no  |
+   |                      |            | environment term.            |
+   +----------------------+------------+------------------------------+
+   | G_SETOTHERMODE_H     | 0x00000000 | G_CYC_1CYCLE.                |
+   +----------------------+------------+------------------------------+
+   | G_SETOTHERMODE_L     | 0x005049D8 | G_RM_AA_ZB_XLU_SURF. Z_CMP   |
+   |                      |            | set, Z_UPD CLEAR, FORCE_BL,  |
+   |                      |            | ZMODE_XLU, and the blender   |
+   |                      |            | CLR_IN*A_IN + CLR_MEM*(1-A). |
+   +----------------------+------------+------------------------------+
+   | G_SETTILE            | 0x00080200 | cm_s = cm_t = CLAMP, mask 0. |
+   |                      |            | The texture does not tile.   |
+   +----------------------+------------+------------------------------+
+   | G_SETTILESIZE        | 0x0007C07C | 32 by 32 texels.             |
+   +----------------------+------------+------------------------------+
+   | G_TEXTURE            | 0x80008000 | S and T scale 0.5.           |
+   +----------------------+------------+------------------------------+
+
+   G_SETENVCOLOR is also issued, carrying crs_color[0].env replicated
+   into all four bytes, but no combiner in the sea pass reads ENV. It is
+   for a later list in the chain. Only course MARIN takes the 2-cycle
+   branch and sets a fog colour from sea_fog_r/g/b/a; every other course
+   runs the 1-cycle path above.
+
+   The consequence that matters most: Z_UPD is clear and the blend is
+   alpha over the framebuffer. The water is TRANSLUCENT. Its alpha comes
+   per-texel from the texture and runs as low as 71 of 255, so a good
+   part of what the eye reads as water is the background seen through
+   it. An opaque draw cannot look like this however right the texture
+   coordinates are.
+
+9.2.  The Sphere Map
+
+   vertex_sea generates tu and tv per vertex from the surface slope.
+   This is the chrome trick from the SGI demos: the texture is not a
+   picture of water laid on the surface, it is a picture of the
+   surroundings indexed by which way the surface faces.
+
+   Per vertex, with heights read as shorts and shifted right 7:
+
+       hA = height of the point one row back,  32 units left
+       hB = height of the point one row on,    32 units left
+       hC = height of the next point in this row
+
+       sx = (((hA + hB) >> 1) - hC) << 6
+       sy = 55 * (hA - hB)
+       d  = sqrt(sx*sx + sy*sy + 12582912)
+
+       tc[0] = sx * (992 / d) + 1024
+       tc[1] = sy * (992 / d) + 1024
+
+   That is a lattice cross product. 64 is the column pitch and 55 the
+   row pitch, 64*sqrt(3)/2 rounded; 12582912 is 3547 squared, and
+   64 * 55.4 is 3547, so the constant is the up component in the same
+   units as the other two. So (sx, sy, 3547) is the unnormalised surface
+   normal, and tc is its XY after normalising, scaled by 992 and centred
+   on 1024.
+
+   Texture coordinates are S10.5, G_TEXTURE halves them, and the texture
+   is 32 texels, so u = tc/2048 and the whole mapping reduces to
+
+       u = 0.5 + 0.484 * nx
+       v = 0.5 + 0.484 * ny
+
+   over a single non-tiled image. Flat water samples the middle texel
+   and the surface is one flat colour. A tilting wave face sweeps the
+   sample across the whole 32 by 32 picture, and since that picture is
+   bright at one end and dark at the other, the face lights up and goes
+   out as it rolls. With CLAMP holding the edges and the per-texel alpha
+   letting the background through, that is the glass.
+
+   THE NEIGHBOUR PAIR IS NOT THE OBVIOUS ONE. vertex_sea has three loop
+   phases and each uses a different index stride:
+
+   +-------------------+---------------+---------------+
+   | Rows              | hA at         | hB at         |
+   +===================+===============+===============+
+   | -(N-1) .. -1      | i - w(r)      | i + w(r)      |
+   +-------------------+---------------+---------------+
+   | 0, the middle row | i - w(r)      | i + w(r) - 1  |
+   +-------------------+---------------+---------------+
+   | 1 .. N-1          | i - w(r) - 1  | i + w(r) - 1  |
+   +-------------------+---------------+---------------+
+
+   where w(r) is row r's width. Three formulas, one geometric meaning:
+   each picks the two points in the adjacent rows that sit 32 units to
+   the left of the centre, and so are level with each other. The strides
+   differ only because the row stagger reverses across the middle row.
+   sea.c builds the pair from that geometric rule instead, having
+   checked it reproduces all three formulas at every interior point.
+
+   The first and last rows get no normal in the original, which leaves
+   their coordinates at whatever the vertex buffer held. sea.c gives
+   them a flat normal, so the rim samples the middle texel. That is a
+   deliberate divergence, and it is visible only at the outermost ring.
+
+9.3.  Per-Course Colour
+
+   There is no per-course tint constant. Each course selects one of
+   eight 32 by 32 RGBA8888 textures through crs_sea[] in
+   _wr64/src_n64/assets/texture/live_textures.c, which copies it into
+   the live buffer sea_tex0 that the display list points at.
+
+   +---------------------+----------------+--------------------------+
+   | Course              | Texture        | Mean RGB                 |
+   +=====================+================+==========================+
+   | DOLPHIN, SANDY      | sot_sea_fine1  | (194, 218, 219)          |
+   +---------------------+----------------+--------------------------+
+   | SUNSET              | sot_sea_eve    | (235, 160, 108)  orange  |
+   +---------------------+----------------+--------------------------+
+   | MARIN               | sot_sea_sto    | (182, 202, 217)          |
+   +---------------------+----------------+--------------------------+
+   | MILKY               | sot_sea_morn   | (183, 222, 220)          |
+   +---------------------+----------------+--------------------------+
+   | PORT                | sot_sea_dirt   | (133, 158, 170)          |
+   +---------------------+----------------+--------------------------+
+   | CASTLE              | sot_sea_night  | ( 34,  50,  59)  dark    |
+   +---------------------+----------------+--------------------------+
+   | SOUTHERN            | sot_sea_fine2  | (173, 223, 241)  cyan    |
+   +---------------------+----------------+--------------------------+
+   | COOL                | sot_sea_ice    | (183, 220, 223)          |
+   +---------------------+----------------+--------------------------+
+
+   So the sunset-orange water, the tropical cyan and the near-black are
+   three of these eight images, not three settings. T cycles them.
+
+   Alpha varies per texel in seven of the eight, from as low as 71 up
+   to 255. sot_sea_dirt is the exception, a flat 176, which is why PORT
+   reads as uniformly murky rather than glassy.
+
+9.4.  The Backdrop Is A Flat Per-Course Fill
+
+   The water is translucent, so most of what the eye reads as its colour
+   is whatever is behind it - and behind it is not a texture. It is one
+   flat rectangle. makeKnSeaBottomGlist, kn_main.c:
+
+       sb_p = &mSeaBottomColorTable[course_num];
+       gSPDisplayList( gp++, dlDispSeaBottom );
+       gDPSetPrimColor( gp++, 0, 0, sb_p->r, sb_p->g, sb_p->b, 255 );
+       gDPFillRectangle( gp++, DISPLAY_X1, DISPLAY_Y1,
+                               DISPLAY_X2, DISPLAY_Y2 );
+
+   It fills the whole display rect in the course's sea-bed colour, and
+   the world and then the water are drawn over it. Running the port
+   windowed shows this plainly: the 4:3 area carries the colour and the
+   letterbox borders do not.
+
+   +------------+----------------+-----------------+
+   | Course     | sea texture    | sea bed colour  |
+   +============+================+=================+
+   | DOLPHIN    | sot_sea_fine1  | 0, 242, 228     |
+   +------------+----------------+-----------------+
+   | SANDY      | sot_sea_fine1  | 0, 242, 228     |
+   +------------+----------------+-----------------+
+   | SUNSET     | sot_sea_eve    | 227, 112, 129   |
+   +------------+----------------+-----------------+
+   | MARIN      | sot_sea_sto    | 43, 135, 146    |
+   +------------+----------------+-----------------+
+   | MILKY      | sot_sea_morn   | 137, 180, 189   |
+   +------------+----------------+-----------------+
+   | PORT       | sot_sea_dirt   | 80, 117, 85     |
+   +------------+----------------+-----------------+
+   | CASTLE     | sot_sea_night  | 12, 58, 117     |
+   +------------+----------------+-----------------+
+   | SOUTHERN   | sot_sea_fine2  | 28, 90, 221     |
+   +------------+----------------+-----------------+
+   | COOL       | sot_sea_ice    | 137, 180, 189   |
+   +------------+----------------+-----------------+
+
+   Texture from crs_sea[] in live_textures.c, colour from
+   mSeaBottomColorTable[] in kn_val.h. One course index picks both, and
+   the demo now does the same: T and Y step through the courses rather
+   than through the textures alone.
+
+   THERE IS NO ENVIRONMENT LIGHT. The sea combiner is TEXEL0 alone, as
+   section 9.1 shows, so nothing tints the texture. The per-course look
+   is the texture plus what shows through it, and nothing else. An
+   earlier version of this program used the texture's own mean colour,
+   dimmed, as the backdrop; that was a guess, and it was wrong.
+
+10.  Drawing Waves
+
+   X held unprojects the cursor onto the water plane and calls sea_push
+   along the path, so a drag leaves a ridge. Three numbers control the
+   stamp, and the wheel tweaks them while A, S or D is held - shift
+   makes a notch worth ten. R puts all three back.
+
+   +-----------+-----+-----+--------+----------------------------------+
+   | Value     | Key | Def | Range  | What it is                       |
+   +===========+=====+=====+========+==================================+
+   | depth     | D   | 64  | 1..120 | Height, before the << 8 into     |
+   |           |     |     |        | fixed point. The ceiling is not  |
+   |           |     |     |        | a matter of taste; see 10.1.     |
+   +-----------+-----+-----+--------+----------------------------------+
+   | spacing   | -   | 32  | fixed  | World units between stamps along |
+   |           |     |     |        | a drag.                          |
+   +-----------+-----+-----+--------+----------------------------------+
+   | step cap  | -   | 64  | fixed  | Most stamps one mouse message    |
+   |           |     |     |        | may place.                       |
+   +-----------+-----+-----+--------+----------------------------------+
+
+   ONLY DEPTH IS A KNOB, and the other two were measured before being
+   demoted rather than guessed at.
+
+   The loop is for (k = 1; k < steps; k++) with steps = len / spacing,
+   so it places steps - 1 points and a steps of 0 or 1 places none. At
+   the home view one pixel is 2.5 world units, which makes the threshold
+
+       spacing  32 -> 25.6 px of travel in one mouse message
+       spacing  16 -> 12.8 px
+       spacing   4 ->  3.2 px
+
+   and Windows delivers mouse messages at about 125 Hz, so an ordinary
+   drag advances a few pixels per message and the interpolation never
+   fires. It does not need to: one sea_push disturbs 64 to 128 world
+   units and consecutive samples land 5 to 25 apart, so the stamps
+   already overlap almost completely. Only a fast flick - 200 px in one
+   message is 500 world units, eight cells - leaves a gap worth filling.
+
+   The step cap is further still from mattering. It clamps only when
+   len / spacing exceeds 64, which at spacing 32 means a single message
+   carrying 2048 world units: the whole width of the mesh. It is a
+   runaway guard for a cursor teleport, not a tuning value.
+
+10.1.  Why Depth Stops At 120
+
+   sea_push stores the height as
+
+       (short)((unsigned short)fdp << 8)
+
+   so only the low 8 bits of the depth survive the shift. 127 is the
+   last value that stores a positive height; 128 to 255 read back
+   NEGATIVE, and any multiple of 256 stores exactly zero. A depth of
+   6400 is 0x1900, which shifts to 0x190000, whose low 16 bits are 0 -
+   it does nothing at all, silently.
+
+   The relaxation lowers the ceiling again. A stamp of 127 is 32512 of
+   a signed short's 32767, and wave_sea then adds to it: a dense drag
+   at 127 drives eight cells over the rail and wraps them negative,
+   which reads as sudden pits. Measured peak height against depth, over
+   200 ticks of a hexagon-filling stamp:
+
+       depth  64 -> peak 17273    no wraps
+       depth 100 -> peak 26898    no wraps
+       depth 110 -> peak 29597    no wraps
+       depth 120 -> peak 32278    no wraps
+       depth 127 -> peak 32721    8 wraps
+
+   So 120, not 127.
+
+10.2.  The push_sea Row Term
+
+   DIVERGENCE FROM THE ORIGINAL, deliberate, and the reason is not what
+   it first looks like.
+
+   push_sea adds (v4 & 0xFFFFFF80) to the row index, where v4 is the hex
+   column. The disassembly confirms it: push_sea at ot_sea.o 0x2DCC has
+
+       li   at,-0x80
+       and  t6,a1,at        a1 is the column
+       addu t2,a0,t6        a0 is the row
+
+   a real mask, not an sra by 7. So the decompile is faithful.
+
+   THE ROM IS NOT BUGGY. ot_sea.c:2481, which builds the mesh corner
+   offsets, adds the same term: (v5 & 0xFFFFFF80) where v5 is that
+   corner's column. Both ends carry the column's high bits into the row,
+   so both agree. Checked over five patch positions including negative
+   ones: 4085 of 4085 corners reachable. It is an odd scheme - a carry
+   out of a 7-bit column field moves 128 rows, not one - but it is
+   consistent, and consistency is all it needs.
+
+   What diverged was THIS PORT. sea_build is the algorithm of
+   make_data_table rather than a transcription of it, and it dropped the
+   carry: offset was simply row (r+1536)%384, column dx&127. Against a
+   faithful push_sea that left only 457 of 817 corners reachable, with
+   the dead region bounded by the line dx = 0 through the centre at 30
+   degrees to the z axis - a wedge, in a staggered lattice, rather than
+   a half. That was the bug, and it was ours.
+
+   BOTH ENDS NOW CARRY IT, as the original does. sea_build takes
+   ot_sea.c:2481 with the patch at the origin, which makes its col_base
+   and row_mod zero and leaves (dx & ~0x7F) + r + 1536. The mesh reads
+   817 distinct cells across rows 0..16, 240..271 and 368..383 - that
+   middle block is the dx < 0 half, 128 rows away, exactly where the
+   original puts it - and sea_push reaches all 817.
+
+   Either end alone is wrong; the pair has to match. Restoring rather
+   than simplifying costs one term and buys the scrolling patch, which
+   is the only thing the extra rows are for.
+
+10.3.  The Walker On The Menu Screens
+
+   On every sea_mode 1 screen the water has something crossing it, and
+   it is not a rider with the model switched off. move_sea runs a single
+   invisible point across the patch, and that point is the ONLY thing
+   disturbing the water there:
+
+       step    51.2 world units per tick, 0.8 of the 64-unit cell
+               pitch, so successive dimples overlap into a wake rather
+               than a dotted line
+       heading r, a 12-bit angle into sin_t[4096]; the +1024 index
+               offset is +90 degrees, so one table serves as sine and
+               cosine both
+       turn    r += ra every tick, so the path is always an arc. ra
+               lands in -7..+6 twelve-bit units, which is -0.615 to
+               +0.527 degrees per tick - a full circle would take about
+               19 seconds, so over a crossing it reads as very nearly
+               straight
+       depth   push_sea(px, pz, -50), NEGATIVE. It digs a trough, not a
+               crest, which is why it looks like a dent being dragged
+
+   Off the patch it respawns at a random point on the rim circle of
+   radius sea_disp_size, with a random heading and a fresh turn rate.
+
+   IT RESPAWNS FAR MORE OFTEN THAN IT APPEARS TO. Measured over 4000
+   ticks: one respawn every 13 ticks, and a mean radius of 747 of 1024.
+   Because the respawn puts it exactly on the rim and then picks a
+   heading at random, about half the time it steps straight back out
+   again. Most of that churn is invisible: the rim circle passes through
+   the +/-x vertices, so a diagonal spawn such as (724, 724) is outside
+   the hexagon and its pushes land on cells no vertex reads. What shows
+   is the occasional one that wanders inward and tracks across.
+
+   Suppressed entirely when game_stat is 6, GAME_STAT_NAME, so the
+   water holds still while a name is being entered.
+
+   F5 toggles it here. The mechanism is the same as X with the mouse -
+   repeated sea_push along a path - with the sign of the depth flipped.
+
+10.4.  The Seed, And Why The Triangles Showed
+
+   Without init_wave_high the mesh is visible as a diamond pattern of
+   facets, worst on gentle wide waves, and no amount of texture
+   filtering helps. The cause is not the filter and not the mesh.
+
+   vertex_sea builds its normal from heights that have already been
+   shifted >> 7, so the gradient is an integer and the smallest step it
+   can take is one. On water that is locally flat the gradient is
+   exactly zero across whole patches, every vertex in the patch gets the
+   same texture coordinate, and a triangle whose three corners share a
+   coordinate samples ONE texel over its whole area. Bilinear filtering
+   cannot rescue that: it smooths the lookup, not a coordinate field
+   that is already constant. Measured on a gentle wave:
+
+   +-----------------------------+-------------+------------------+
+   | state                       | distinct UV | flat-normal      |
+   +=============================+=============+==================+
+   | unseeded                    |          89 | 490 of 817       |
+   +-----------------------------+-------------+------------------+
+   | init_wave_high(20)          |         243 | 15 of 817        |
+   +-----------------------------+-------------+------------------+
+   | seeded, 120 ticks later     |          31 | 157 of 817       |
+   +-----------------------------+-------------+------------------+
+   | seeded, 400 ticks later     |           7 | 563 of 817       |
+   +-----------------------------+-------------+------------------+
+
+   So the game is never in the degenerate regime: init_sea seeds the
+   whole buffer every time a screen is entered, and the chop keeps the
+   gradient clear of the quantisation floor everywhere. The seed matters
+   for the NORMALS, not for the motion, which is why it was easy to
+   leave out and hard to spot.
+
+   The field is biased positive and smaller than the nominal +/- high,
+   about 5 to 18 world units for high = 20, because only one of the six
+   accumulator slots is ever refreshed. See the note in sea.c.
+
+   IT DECAYS. The damping eats the chop over a few hundred ticks and the
+   facets come back, as the table shows. The game re-seeds on every
+   screen entry; here M does it on demand, and Space clears it along
+   with everything else.
+
+   The gradient precision itself is still the original's. Computing the
+   slope from unshifted heights would remove the floor outright and keep
+   gentle water smooth indefinitely, but that is a divergence from the
+   ROM and is not done.
+
+11.  Open Questions
+
+   ANSWERED, see 10.3 and 10.4: the sea_mode 1 screens are driven by
+   move_sea's walker, one invisible point pushing a trough per tick, on
+   top of the init_wave_high seed. Both are ported. ot_sea_report
+   section 7 calls the injection "ambient push_sea ripples at a fixed
+   centre", which is wrong on both counts - it wanders, and it is a
+   single point. That report wants correcting.
+
+   WHAT IS sea_offset ON THAT SCREEN? It is the visible water level and
+   it is added to every baked Y. A wrong value puts the grid above or
+   below the camera. Read it live rather than guessing a constant.
